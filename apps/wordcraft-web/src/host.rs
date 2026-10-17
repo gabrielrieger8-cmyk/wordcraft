@@ -10,8 +10,11 @@
 //! - `wordcraft:dirty` (to the parent): `{ dirty }` whenever unsaved changes appear or go away.
 //! - `wordcraft:failed` (to the parent): `{ error }` when the app couldn't start.
 //!
-//! Only the parent window on the page's own origin is heard or answered. In host mode the page
-//! starts with a blank document instead of the Start screen or the sample.
+//! Only the parent window on the page's own origin is heard or answered, unless the URL names
+//! the parent's origin with `&hostOrigin=` (an exact origin such as `https://host.example`, for
+//! a host that serves WordCraft from another origin to sandbox it): then only that origin is,
+//! and messages are posted to it alone. A `hostOrigin` that isn't an origin turns the bridge off.
+//! In host mode the page starts with a blank document instead of the Start screen or the sample.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -41,7 +44,7 @@ impl Bridge {
         if js_sys::Object::is(&parent, &window) {
             return None;
         }
-        let origin = window.location().origin().ok()?;
+        let origin = host_origin(&window)?;
         Some(Self { window, parent, origin, reported: Rc::default() })
     }
 
@@ -113,6 +116,19 @@ impl Bridge {
     fn send(&self, fields: &[(&str, JsValue)]) -> bool {
         message(fields).is_some_and(|m| self.parent.post_message(&m, &self.origin).is_ok())
     }
+}
+
+/// The origin the parent must have: the page's own, or the one `?hostOrigin=` names. `None`
+/// (no bridge) when `hostOrigin` isn't exactly an origin: no path, no wildcard, no `null`.
+fn host_origin(window: &web_sys::Window) -> Option<String> {
+    let location = window.location();
+    let named = web_sys::UrlSearchParams::new_with_str(&location.search().ok()?).ok()?.get("hostOrigin");
+    let Some(named) = named else { return location.origin().ok() };
+    let origin = web_sys::Url::new(&named).ok().map(|url| url.origin()).filter(|o| *o == named && o != "null");
+    if origin.is_none() {
+        log::error!("hostOrigin {named:?} isn't an origin (like https://host.example): not talking to the parent page");
+    }
+    origin
 }
 
 fn message(fields: &[(&str, JsValue)]) -> Option<js_sys::Object> {

@@ -1,0 +1,153 @@
+# pyxis fork only (see PYXIS.md). Builds ONLY the web (wasm) zip, the same way upstream's
+# release does it (storytold/craft-common-actions .github/workflows/release.yml, job `web`:
+# stable Rust + wasm32-unknown-unknown, trunk 0.21.14, packaging/web/package.sh, which runs
+# `trunk build --release` -> wasm-opt -Oz via data-wasm-opt="z" in index.html, no craft-fonts),
+# and publishes <app>-web-<upstreamver>-pyxis.<n>.zip + .sha256 as a release of THIS fork.
+# Needs no secrets: only the automatic GITHUB_TOKEN (contents: write, to create the release).
+name: pyxis-web
+
+on:
+  push:
+    tags: ["v*-pyxis.*"]
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream release tag this build is based on, e.g. v0.7.0"
+        type: string
+        required: true
+      pyxis_rev:
+        description: "pyxis revision n -> version <upstreamver>-pyxis.<n> (tag created at the run's commit)"
+        type: string
+        required: true
+        default: "0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pyxis-web-${{ github.ref }}-${{ inputs.upstream_tag }}-${{ inputs.pyxis_rev }}
+  cancel-in-progress: false
+
+jobs:
+  web:
+    name: Web (wasm) pyxis
+    if: github.repository_owner != 'storytold'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags + history, to prove the upstream tag is an ancestor
+
+      - name: Resolve version
+        id: v
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          IN_TAG: ${{ inputs.upstream_tag }}
+          IN_REV: ${{ inputs.pyxis_rev }}
+        run: |
+          set -euo pipefail
+          app="${GITHUB_REPOSITORY#*/}"
+          if [ "$EVENT" = push ]; then
+            tag="$REF_NAME"
+            [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-pyxis\.(0|[1-9][0-9]*)$ ]] || { echo "::error::tag '$tag' is not v<x.y.z>-pyxis.<n>"; exit 1; }
+            up="${BASH_REMATCH[1]}"; rev="${BASH_REMATCH[2]}"
+          else
+            [[ "$IN_TAG" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+)$ ]] || { echo "::error::upstream_tag '$IN_TAG' is not v<x.y.z>"; exit 1; }
+            up="${BASH_REMATCH[1]}"
+            [[ "$IN_REV" =~ ^(0|[1-9][0-9]*)$ ]] || { echo "::error::pyxis_rev '$IN_REV' is not a number"; exit 1; }
+            rev="$IN_REV"; tag="v$up-pyxis.$rev"
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null && [ "$(git rev-parse "$tag^{commit}")" != "$GITHUB_SHA" ]; then
+              echo "::error::tag $tag already exists at another commit"; exit 1
+            fi
+          fi
+          git rev-parse -q --verify "refs/tags/v$up^{commit}" >/dev/null || { echo "::error::upstream tag v$up is not in this fork (git push origin v$up)"; exit 1; }
+          git merge-base --is-ancestor "v$up" "$GITHUB_SHA" || { echo "::error::v$up is not an ancestor of $GITHUB_SHA"; exit 1; }
+          if [ -f packaging/env.sh ]; then . packaging/env.sh; else . packaging/common.sh; fi
+          [ "$(workspace_version)" = "$up" ] || { echo "::error::Cargo.toml version $(workspace_version) != upstream tag $up"; exit 1; }
+          ver="$up-pyxis.$rev"
+          {
+            echo "app=$app"; echo "up=$up"; echo "rev=$rev"; echo "tag=$tag"; echo "version=$ver"
+            echo "upsha=$(git rev-parse "v$up^{commit}")"; echo "date=$(date -u +%Y-%m-%d)"
+          } >>"$GITHUB_OUTPUT"
+          # package.sh (via packaging/env.sh|common.sh) names the zip and its top folder from
+          # <APP>_VERSION and bakes <APP>_BUILD_SHA/_BUILD_DATE in, like upstream's web job.
+          P="$(printf '%s' "$app" | tr '[:lower:]' '[:upper:]')"
+          { echo "${P}_VERSION=$ver"; echo "${P}_BUILD_SHA=$GITHUB_SHA"; echo "${P}_BUILD_DATE=$(date -u +%Y-%m-%d)"; } >>"$GITHUB_ENV"
+          echo "### $app v$ver (upstream v$up \`${GITHUB_SHA::9}\`)" >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: pyxis-web
+      # Upstream's own installer (sha256-verified trunk 0.21.14), pinned instead of @main.
+      - uses: storytold/craft-common-actions/actions/install-trunk@43f4e83c68764f9d880f8a6c10328bc550465f2b
+        with:
+          trunk-version: "0.21.14"
+
+      - name: Build and zip
+        run: packaging/web/package.sh
+
+      - name: Checksum
+        id: sum
+        shell: bash
+        env:
+          ZIP: ${{ steps.v.outputs.app }}-web-${{ steps.v.outputs.version }}.zip
+        run: |
+          set -euo pipefail
+          cd dist/release
+          [ -f "$ZIP" ] || { echo "::error::$ZIP not produced"; ls -la; exit 1; }
+          sha256sum "$ZIP" >"$ZIP.sha256"
+          cat "$ZIP.sha256"
+          echo "sha256=$(cut -d' ' -f1 "$ZIP.sha256")" >>"$GITHUB_OUTPUT"
+          { rustc -V; cargo -V; trunk --version; } | tee toolchain.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pyxis-web
+          path: dist/release/*
+          if-no-files-found: error
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP: ${{ steps.v.outputs.app }}
+          TAG: ${{ steps.v.outputs.tag }}
+          VER: ${{ steps.v.outputs.version }}
+          UP: ${{ steps.v.outputs.up }}
+          UPSHA: ${{ steps.v.outputs.upsha }}
+          SHA256: ${{ steps.sum.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          zip="dist/release/$APP-web-$VER.zip"
+          {
+            echo "pyxis build of upstream [storytold/$APP v$UP](https://github.com/storytold/$APP/releases/tag/v$UP) (\`$UPSHA\`)."
+            echo
+            echo "Web (wasm) only, built like upstream's release web job. Commit: \`$GITHUB_SHA\`."
+            echo
+            echo "Patches on top of v$UP:"
+            echo '```'
+            git log --reverse --format='%h %s' "v$UP..$GITHUB_SHA"
+            echo '```'
+            echo
+            echo "sha256 \`$SHA256\`  $APP-web-$VER.zip"
+            echo
+            echo '```'
+            cat dist/release/toolchain.txt
+            echo '```'
+          } >notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists; bump the pyxis revision"; exit 1
+          fi
+          gh release create "$TAG" "$zip" "$zip.sha256" \
+            --target "$GITHUB_SHA" --title "$APP v$VER" --notes-file notes.md --latest=false
